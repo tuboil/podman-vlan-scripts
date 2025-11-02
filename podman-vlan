@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# ==========================================================
+# Script CLI : podman-vlan
+# Description : Gestion VLAN + bridge pour Podman Desktop (Ubuntu 24.04+)
+# Version : 2.1 (avec mode --verbose)
+# ==========================================================
+
+set -euo pipefail
+
+# --- Couleurs ---
+GREEN="\e[32m"; RED="\e[31m"; YELLOW="\e[33m"; BLUE="\e[34m"; RESET="\e[0m"
+
+# --- Fonctions utilitaires ---
+log()   { echo -e "${GREEN}$*${RESET}"; }
+warn()  { echo -e "${YELLOW}$*${RESET}"; }
+error() { echo -e "${RED}$*${RESET}" >&2; exit 1; }
+info()  { echo -e "${BLUE}$*${RESET}"; }
+
+usage() {
+  cat <<EOF
+Usage : sudo podman-vlan <create|delete|list|inspect> [<VLAN_ID>] [<SUBNET>] [<INTERFACE>] [--no-test] [--dry-run] [--gateway <IP>] [--verbose]
+
+Options :
+  --no-test     Ne pas lancer de conteneur de test après création
+  --dry-run     Affiche les commandes sans les exécuter
+  --gateway IP  Force l'adresse de la passerelle du VLAN
+  --verbose     Affiche les commandes exécutées et le contenu du fichier CNI
+
+Exemples :
+  sudo podman-vlan create 10 10.10.10.0/24 eth0
+  sudo podman-vlan create 20 192.168.50.0/24 --gateway 192.168.50.254
+  sudo podman-vlan list
+EOF
+  exit 1
+}
+
+# --- Vérifications de base ---
+[ "$EUID" -ne 0 ] && error "Ce script doit être exécuté en root."
+
+for cmd in ip podman awk grep sed; do
+  command -v "$cmd" >/dev/null 2>&1 || error "Commande requise manquante : $cmd"
+done
+
+# --- Parsing des arguments ---
+ACTION="${1:-}"
+VLAN_ID="${2:-}"
+SUBNET="${3:-}"
+PHY_IF="${4:-}"
+NO_TEST=0
+DRY_RUN=0
+VERBOSE=0
+GATEWAY_OPT=""
+
+for i in "$@"; do
+  case "$i" in
+    --no-test) NO_TEST=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --verbose) VERBOSE=1 ;;
+    --gateway) GATEWAY_OPT_NEXT=1 ;;
+    *)
+      if [[ "${GATEWAY_OPT_NEXT:-0}" -eq 1 ]]; then
+        GATEWAY_OPT="$i"
+        GATEWAY_OPT_NEXT=0
+      fi
+      ;;
+  esac
+done
+
+[ -z "$ACTION" ] && usage
+
+# --- Détection interface si non spécifiée ---
+if [ -z "${PHY_IF:-}" ]; then
+  PHY_IF=$(ip route | awk '/default/ {print $5; exit}')
+fi
+ip link show "$PHY_IF" >/dev/null 2>&1 || error "Interface réseau invalide : $PHY_IF"
+
+VLAN_IF="${PHY_IF}.${VLAN_ID:-0}"
+BRIDGE="br-vlan${VLAN_ID:-0}"
+CNI_FILE="/etc/cni/net.d/20-vlan${VLAN_ID:-0}.conflist"
+
+# --- Fonction dry-run + verbose ---
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[DRY-RUN] $*"
+  else
+    [ "$VERBOSE" -eq 1 ] && echo "+ $*"
+    eval "$@"
+  fi
+}
+
+# ==========================================================
+# CREATE VLAN
+# ==========================================================
+create_vlan() {
+  [ -z "$VLAN_ID" ] && usage
+  [ -z "$SUBNET" ] && error "Sous-réseau manquant (ex: 10.10.10.0/24)."
+  [[ ! "$SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && error "Format de sous-réseau invalide."
+
+  # Détermination de la gateway
+  if [ -n "$GATEWAY_OPT" ]; then
+    GATEWAY="$GATEWAY_OPT"
+  else
+    GATEWAY=$(echo "$SUBNET" | sed -E 's#([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+/.*#\1.1#')
+  fi
+
+  info "=== Création VLAN ${VLAN_ID} sur ${PHY_IF} ==="
+  echo "VLAN_IF: $VLAN_IF | Bridge: $BRIDGE | Subnet: $SUBNET | Gateway: $GATEWAY"
+
+  # Vérification existence
+  if ip link show "$VLAN_IF" >/dev/null 2>&1; then
+    warn "Interface VLAN $VLAN_IF existe déjà."
+    return
+  fi
+  if ip link show "$BRIDGE" >/dev/null 2>&1; then
+    warn "Bridge $BRIDGE existe déjà."
+    return
+  fi
+
+  # Création VLAN et Bridge
+  run ip link add link "$PHY_IF" name "$VLAN_IF" type vlan id "$VLAN_ID"
+  run ip link set "$VLAN_IF" up
+  run ip link add name "$BRIDGE" type bridge
+  run ip link set "$VLAN_IF" master "$BRIDGE"
+  run ip link set "$BRIDGE" up
+  run ip addr add "$GATEWAY"/$(echo "$SUBNET" | cut -d'/' -f2) dev "$BRIDGE" || true
+
+  # Génération fichier CNI
+  mkdir -p /etc/cni/net.d
+  cat > "$CNI_FILE" <<EOF
+{
+  "cniVersion": "0.4.0",
+  "name": "vlan${VLAN_ID}",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "${BRIDGE}",
+      "isGateway": true,
+      "ipMasq": false,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [[{ "subnet": "${SUBNET}", "gateway": "${GATEWAY}" }]]
+      }
+    }
+  ]
+}
+EOF
+  chmod 600 "$CNI_FILE"
+
+  if [ "$VERBOSE" -eq 1 ]; then
+    echo "---- Fichier CNI généré ----"
+    cat "$CNI_FILE"
+    echo "-----------------------------"
+  fi
+
+  # Test conteneur
+  if [ "$NO_TEST" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    info "Test conteneur Podman..."
+    if podman network inspect vlan${VLAN_ID} >/dev/null 2>&1; then
+      warn "Réseau Podman vlan${VLAN_ID} existe déjà."
+    else
+      run podman network create --file "$CNI_FILE" >/dev/null 2>&1 || true
+    fi
+    run podman run --rm -d --network vlan${VLAN_ID} --name test-vlan${VLAN_ID} alpine sleep 15 >/dev/null 2>&1 || true
+    sleep 2
+    CONTAINER_IP=$(podman exec test-vlan${VLAN_ID} ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || true)
+    [ -n "$CONTAINER_IP" ] && log "Conteneur lancé sur $CONTAINER_IP"
+    run podman rm -f test-vlan${VLAN_ID} >/dev/null 2>&1 || true
+  else
+    warn "Test conteneur désactivé (--no-test ou --dry-run)"
+  fi
+
+  log "VLAN ${VLAN_ID} créé avec succès."
+}
+
+# ==========================================================
+# DELETE VLAN
+# ==========================================================
+delete_vlan() {
+  [ -z "$VLAN_ID" ] && usage
+  info "=== Suppression VLAN ${VLAN_ID} ==="
+
+  if ! ip link show "$VLAN_IF" >/dev/null 2>&1 && ! ip link show "$BRIDGE" >/dev/null 2>&1; then
+    warn "VLAN ${VLAN_ID} inexistant."
+    return
+  fi
+
+  run podman ps --filter "network=vlan${VLAN_ID}" -q | xargs -r podman rm -f
+  run podman network rm -f "vlan${VLAN_ID}" 2>/dev/null || true
+  run rm -f "$CNI_FILE" || true
+  run ip link set "$VLAN_IF" down 2>/dev/null || true
+  run ip link delete "$VLAN_IF" 2>/dev/null || true
+  run ip link set "$BRIDGE" down 2>/dev/null || true
+  run ip link delete "$BRIDGE" 2>/dev/null || true
+
+  log "VLAN ${VLAN_ID} supprimé."
+}
+
+# ==========================================================
+# LIST VLANs (aligné)
+# ==========================================================
+list_vlans() {
+  info "=== VLANs Podman configurés ==="
+  printf "%-6s %-14s %-14s %-20s %-8s %-8s\n" "ID" "Bridge" "VLAN IF" "Subnet" "Bridge" "Podman"
+  echo "----------------------------------------------------------------------"
+  for file in /etc/cni/net.d/20-vlan*.conflist; do
+    [ -f "$file" ] || continue
+    VID=$(echo "$file" | grep -oE '[0-9]+')
+    BR="br-vlan${VID}"
+    VLAN=$(ip -o link show | awk -F': ' '{print $2}' | grep -E "\.${VID}$" | head -n1 || echo "-")
+    SUB=$(grep -oE '"subnet": *"[^"]+"' "$file" | cut -d'"' -f4)
+    BR_STATE=$(ip link show "$BR" 2>/dev/null | grep -q "state UP" && echo "UP" || echo "DOWN")
+    POD=$(podman network inspect vlan${VID} >/dev/null 2>&1 && echo "YES" || echo "NO")
+    printf "%-6s %-14s %-14s %-20s %-8s %-8s\n" "$VID" "$BR" "$VLAN" "$SUB" "$BR_STATE" "$POD"
+  done
+}
+
+# ==========================================================
+# INSPECT VLAN
+# ==========================================================
+inspect_vlan() {
+  [ -z "$VLAN_ID" ] && usage
+  [ ! -f "$CNI_FILE" ] && error "Aucun fichier CNI pour VLAN ${VLAN_ID}."
+
+  SUBNET=$(grep -oE '"subnet": *"[^"]+"' "$CNI_FILE" | cut -d'"' -f4)
+  BRIDGE_STATE=$(ip link show "$BRIDGE" 2>/dev/null | grep -q "state UP" && echo "UP" || echo "DOWN")
+  VLAN_STATE=$(ip link show "$VLAN_IF" 2>/dev/null | grep -q "state UP" && echo "UP" || echo "DOWN")
+  POD=$(podman network inspect vlan${VLAN_ID} >/dev/null 2>&1 && echo "YES" || echo "NO")
+
+  info "=== Inspection VLAN ${VLAN_ID} ==="
+  echo "Bridge:  $BRIDGE ($BRIDGE_STATE)"
+  echo "VLAN IF: $VLAN_IF ($VLAN_STATE)"
+  echo "Subnet:  $SUBNET"
+  echo "Réseau Podman: $POD"
+  echo
+  podman ps --filter "network=vlan${VLAN_ID}" --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Networks}}" || echo "Aucun conteneur."
+}
+
+# ==========================================================
+# Dispatcher
+# ==========================================================
+case "$ACTION" in
+  create)  create_vlan ;;
+  delete)  delete_vlan ;;
+  list)    list_vlans ;;
+  inspect) inspect_vlan ;;
+  *)       usage ;;
+esac
+
