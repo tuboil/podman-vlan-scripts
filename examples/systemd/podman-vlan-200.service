@@ -1,0 +1,12 @@
+[Unit]
+Description=Ensure podman VLAN 200 exists
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/podman-vlan create 200 192.168.200.0/24 eth0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
